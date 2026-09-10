@@ -224,3 +224,17 @@ def resolve_entity(rel_path: str, content: Optional[str] = None) -> EntityResolu
 
 def known_entity_names() -> list[str]:
     return [e.name for e in ENTITY_REGISTRY]
+
+
+def canonical_path_for_entity(entity: str) -> Optional[str]:
+    """Return the registered canonical vault path for a known entity name,
+    or None if the entity has no registered canonical target. Reads the
+    same ENTITY_REGISTRY Layer 4 already uses (the vault_note field) --
+    no filename-similarity guessing, no invented paths. An entity absent
+    from ENTITY_REGISTRY, or present but with vault_note=None, returns
+    None -- callers (Layer 7) must treat that as ESCALATE/NO_CANONICAL_TARGET,
+    never as license to invent a path."""
+    e = _BY_NAME.get(entity)
+    if e is None:
+        return None
+    return e.vault_note
