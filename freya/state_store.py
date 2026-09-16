@@ -72,8 +72,126 @@ CREATE TABLE IF NOT EXISTS fact_fingerprints (
     first_seen_ts   REAL NOT NULL,
     PRIMARY KEY (entity, fingerprint)
 );
+
+-- Layer 6 (relationship engine) graph ledger. Additive: brand-new tables,
+-- touches nothing from Layers 1-5. Fingerprint is (source_entity, rel_type,
+-- normalized_target) per relationship_engine.relationship_fingerprint --
+-- deliberately WITHOUT temporal_status, so a second source confirming the
+-- same edge collapses onto one row (CONFIRM) instead of duplicating, and
+-- supersession is a status flip on the existing row, not a new row.
+CREATE TABLE IF NOT EXISTS relationships (
+    fingerprint       TEXT PRIMARY KEY,
+    source_entity     TEXT NOT NULL,
+    rel_type          TEXT NOT NULL,
+    target            TEXT NOT NULL,
+    temporal_status   TEXT NOT NULL,
+    confidence        TEXT NOT NULL,
+    status            TEXT NOT NULL DEFAULT 'ACTIVE',  -- ACTIVE | SUPERSEDED
+    evidence          TEXT,     -- JSON list
+    source_files      TEXT,     -- JSON list
+    confirm_count     INTEGER NOT NULL DEFAULT 1,
+    discovered_at     REAL NOT NULL,
+    last_confirmed_at REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_relationships_source ON relationships(source_entity);
+CREATE INDEX IF NOT EXISTS idx_relationships_status ON relationships(status);
+
+-- One row per Layer 6 RELATIONSHIP_CONFLICT decision (evaluate_candidate
+-- action=CONFLICT). Never auto-resolved -- Layer 6 does not silently pick
+-- a winner between two current-flavored claims for the same (source,
+-- rel_type) pointing at different targets.
+CREATE TABLE IF NOT EXISTS relationship_conflicts (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_entity  TEXT NOT NULL,
+    rel_type       TEXT NOT NULL,
+    packet_json    TEXT NOT NULL,   -- full build_relationship_conflict_packet() dict
+    status         TEXT NOT NULL DEFAULT 'OPEN',  -- OPEN | RESOLVED
+    created_at     REAL NOT NULL,
+    resolved_at    REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_relconflicts_status ON relationship_conflicts(status);
+CREATE INDEX IF NOT EXISTS idx_relconflicts_entity ON relationship_conflicts(source_entity);
+
+-- Layer 7 (canonical change planner) output. One row per build_plan() call.
+CREATE TABLE IF NOT EXISTS plans (
+    plan_id        TEXT PRIMARY KEY,
+    source_file    TEXT,
+    plan_json      TEXT NOT NULL,   -- full build_plan() dict, including all proposals
+    created_at     REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_plans_source_file ON plans(source_file);
+
+-- One row per distinct ChangeProposal fingerprint (== proposal_id).
+-- Upserted by fingerprint: re-planning identical inputs increments
+-- seen_count on the same row rather than duplicating -- idempotency
+-- enforced at the storage layer, not just at fingerprint-computation time.
+CREATE TABLE IF NOT EXISTS proposals (
+    fingerprint     TEXT PRIMARY KEY,
+    plan_id         TEXT,
+    action          TEXT,
+    entity          TEXT,
+    canonical_path  TEXT,
+    proposal_json   TEXT NOT NULL,  -- full ChangeProposal.to_dict()
+    seen_count      INTEGER NOT NULL DEFAULT 1,
+    first_seen_at   REAL NOT NULL,
+    last_seen_at    REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_proposals_entity ON proposals(entity);
+CREATE INDEX IF NOT EXISTS idx_proposals_path ON proposals(canonical_path);
+CREATE INDEX IF NOT EXISTS idx_proposals_action ON proposals(action);
+
+-- Phase 8 (canonical write executor) transaction ledger. Additive: one
+-- row per attempted proposal execution (DRY_RUN or APPLY). `state` is
+-- FREYA's own finer-grained status; `enforcer_state` mirrors the real
+-- knowledge-enforcer's manifest state where a transaction reached one.
+CREATE TABLE IF NOT EXISTS transactions (
+    transaction_id        TEXT PRIMARY KEY,
+    plan_id                TEXT,
+    proposal_fingerprint   TEXT NOT NULL,
+    entity                 TEXT,
+    canonical_path         TEXT,
+    action                 TEXT,
+    mode                   TEXT NOT NULL,
+    state                  TEXT NOT NULL,
+    enforcer_state          TEXT,
+    pre_hash                TEXT,
+    post_hash                TEXT,
+    error                    TEXT,
+    created_at               REAL NOT NULL,
+    updated_at               REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_transactions_fp ON transactions(proposal_fingerprint);
+CREATE INDEX IF NOT EXISTS idx_transactions_state ON transactions(state);
+CREATE INDEX IF NOT EXISTS idx_transactions_path ON transactions(canonical_path);
+
+CREATE TABLE IF NOT EXISTS transaction_events (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    transaction_id  TEXT NOT NULL,
+    event           TEXT NOT NULL,
+    result          TEXT,
+    detail_json     TEXT,
+    created_at      REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_txevents_tx ON transaction_events(transaction_id);
+
+-- Per-canonical-path advisory lock. A row present means a transaction
+-- currently holds that path; PRIMARY KEY collision is the contention
+-- signal a second concurrent transaction fails on.
+CREATE TABLE IF NOT EXISTS path_locks (
+    canonical_path  TEXT PRIMARY KEY,
+    transaction_id  TEXT NOT NULL,
+    locked_at       REAL NOT NULL
+);
 """
 
+
+_CONFIDENCE_RANK = {"LOW": 1, "MEDIUM": 2, "HIGH": 3}
 
 def hash_file(path: Path, chunk_size: int = 1 << 16) -> str:
     """Stable content hash. Used for idempotency — NOT for secret detection."""
@@ -409,6 +527,312 @@ class FreyaStateStore:
                 f"ON CONFLICT(path) DO UPDATE SET {updates}",
                 [payload[c] for c in cols],
             )
+
+    # ---- Layer 6: relationship ledger -----------------------------------
+
+    @staticmethod
+    def _relationship_row_to_dict(row: sqlite3.Row) -> dict:
+        d = dict(row)
+        d["evidence"] = json.loads(d["evidence"]) if d.get("evidence") else []
+        d["source_files"] = json.loads(d["source_files"]) if d.get("source_files") else []
+        return d
+
+    def get_relationship_by_fingerprint(self, fingerprint: str) -> Optional[dict]:
+        with self._cursor() as cur:
+            row = cur.execute(
+                "SELECT * FROM relationships WHERE fingerprint = ?", (fingerprint,)
+            ).fetchone()
+        return self._relationship_row_to_dict(row) if row else None
+
+    def get_active_relationships_for_source(self, source_entity: str) -> list[dict]:
+        with self._cursor() as cur:
+            rows = cur.execute(
+                "SELECT * FROM relationships WHERE source_entity = ? AND status = 'ACTIVE'",
+                (source_entity,),
+            ).fetchall()
+        return [self._relationship_row_to_dict(r) for r in rows]
+
+    def get_relationships_for_entities(self, entities: list[str]) -> list[dict]:
+        """ACTIVE + SUPERSEDED rows for the given entities -- feeds Layer 7's
+        plan_relationship, which handles both statuses itself."""
+        if not entities:
+            return []
+        placeholders = ",".join("?" for _ in entities)
+        with self._cursor() as cur:
+            rows = cur.execute(
+                f"SELECT * FROM relationships WHERE source_entity IN ({placeholders})",
+                tuple(entities),
+            ).fetchall()
+        return [self._relationship_row_to_dict(r) for r in rows]
+
+    def upsert_relationship(self, candidate, status: str, source_path: Optional[str] = None) -> dict:
+        """ADD or SUPERSEDE_AND_ADD path: insert a new relationship row (or
+        replace one at the same fingerprint, defensively). `candidate` is a
+        relationship_engine.RelationshipCandidate."""
+        from .relationship_engine import relationship_fingerprint
+        fp = relationship_fingerprint(candidate.source, candidate.rel_type, candidate.target)
+        now = time.time()
+        source_files = list(candidate.source_files or [])
+        if source_path and source_path not in source_files:
+            source_files.append(source_path)
+        with self._cursor() as cur:
+            cur.execute(
+                "INSERT INTO relationships (fingerprint, source_entity, rel_type, target, "
+                "temporal_status, confidence, status, evidence, source_files, confirm_count, "
+                "discovered_at, last_confirmed_at) VALUES (?,?,?,?,?,?,?,?,?,1,?,?) "
+                "ON CONFLICT(fingerprint) DO UPDATE SET "
+                "temporal_status=excluded.temporal_status, confidence=excluded.confidence, "
+                "status=excluded.status, evidence=excluded.evidence, "
+                "source_files=excluded.source_files, last_confirmed_at=excluded.last_confirmed_at",
+                (fp, candidate.source, candidate.rel_type, candidate.target,
+                 candidate.temporal_status, candidate.confidence, status,
+                 json.dumps(candidate.evidence or []), json.dumps(source_files), now, now),
+            )
+        self.audit(source_path, candidate.source, "relationship_recorded",
+                   {"fingerprint": fp, "rel_type": candidate.rel_type, "target": candidate.target,
+                    "status": status})
+        return self.get_relationship_by_fingerprint(fp)
+
+    def confirm_relationship(self, fingerprint: str, candidate, source_path: Optional[str] = None) -> dict:
+        """CONFIRM path: exact-fingerprint match already exists -- merge
+        evidence/source_files onto it, take the stronger confidence,
+        increment confirm_count. Never a new row."""
+        existing = self.get_relationship_by_fingerprint(fingerprint)
+        if existing is None:
+            raise KeyError(fingerprint)
+        merged_evidence = existing["evidence"] + list(candidate.evidence or [])
+        merged_sources = list(existing["source_files"])
+        candidate_sources = list(candidate.source_files or [])
+        if source_path:
+            candidate_sources.append(source_path)
+        for s in candidate_sources:
+            if s and s not in merged_sources:
+                merged_sources.append(s)
+        stronger_confidence = existing["confidence"]
+        if _CONFIDENCE_RANK.get(candidate.confidence, 0) > _CONFIDENCE_RANK.get(stronger_confidence, 0):
+            stronger_confidence = candidate.confidence
+        now = time.time()
+        with self._cursor() as cur:
+            cur.execute(
+                "UPDATE relationships SET evidence=?, source_files=?, confidence=?, "
+                "confirm_count=confirm_count+1, last_confirmed_at=? WHERE fingerprint=?",
+                (json.dumps(merged_evidence), json.dumps(merged_sources), stronger_confidence,
+                 now, fingerprint),
+            )
+        self.audit(source_path, existing["source_entity"], "relationship_confirmed",
+                   {"fingerprint": fingerprint})
+        return self.get_relationship_by_fingerprint(fingerprint)
+
+    def mark_relationship_superseded(self, fingerprint: str) -> None:
+        with self._cursor() as cur:
+            cur.execute("UPDATE relationships SET status='SUPERSEDED' WHERE fingerprint=?", (fingerprint,))
+        self.audit(None, None, "relationship_superseded", {"fingerprint": fingerprint})
+
+    def record_relationship_conflict(self, packet: dict) -> None:
+        """Persists a relationship_engine.build_relationship_conflict_packet()
+        dict. Never auto-resolved by this method -- opening a conflict is
+        the terminal action for that candidate this pass."""
+        now = time.time()
+        with self._cursor() as cur:
+            cur.execute(
+                "INSERT INTO relationship_conflicts (source_entity, rel_type, packet_json, status, created_at) "
+                "VALUES (?,?,?,?,?)",
+                (packet["source_entity"], packet["relationship_type"], json.dumps(packet), "OPEN", now),
+            )
+        self.audit(None, packet["source_entity"], "relationship_conflict_opened",
+                   {"reason": packet.get("reason")})
+
+    def open_relationship_conflicts(self) -> list[dict]:
+        with self._cursor() as cur:
+            rows = cur.execute(
+                "SELECT packet_json FROM relationship_conflicts WHERE status = 'OPEN'"
+            ).fetchall()
+        return [json.loads(r["packet_json"]) for r in rows]
+
+    # ---- Layer 7: plans / proposals --------------------------------------
+
+    def record_plan(self, plan: dict, source_file: Optional[str] = None) -> None:
+        now = time.time()
+        with self._cursor() as cur:
+            cur.execute(
+                "INSERT INTO plans (plan_id, source_file, plan_json, created_at) VALUES (?,?,?,?) "
+                "ON CONFLICT(plan_id) DO UPDATE SET plan_json=excluded.plan_json",
+                (plan["plan_id"], source_file, json.dumps(plan), now),
+            )
+        self.audit(source_file, None, "plan_recorded",
+                   {"plan_id": plan["plan_id"], "proposal_count": len(plan.get("proposals", []))})
+
+    def get_plan(self, plan_id: str) -> Optional[dict]:
+        with self._cursor() as cur:
+            row = cur.execute("SELECT plan_json FROM plans WHERE plan_id = ?", (plan_id,)).fetchone()
+        return json.loads(row["plan_json"]) if row else None
+
+    def record_proposals(self, proposals: list[dict], plan_id: Optional[str] = None) -> None:
+        """Upsert-by-fingerprint. Re-planning identical inputs increments
+        seen_count on the same row instead of duplicating -- idempotency at
+        the storage layer, not just at fingerprint-computation time."""
+        now = time.time()
+        with self._cursor() as cur:
+            for p in proposals:
+                fp = p["fingerprint"]
+                existing = cur.execute(
+                    "SELECT seen_count FROM proposals WHERE fingerprint = ?", (fp,)
+                ).fetchone()
+                if existing:
+                    cur.execute(
+                        "UPDATE proposals SET seen_count = seen_count + 1, last_seen_at = ?, "
+                        "proposal_json = ? WHERE fingerprint = ?",
+                        (now, json.dumps(p), fp),
+                    )
+                else:
+                    cur.execute(
+                        "INSERT INTO proposals (fingerprint, plan_id, action, entity, canonical_path, "
+                        "proposal_json, seen_count, first_seen_at, last_seen_at) "
+                        "VALUES (?,?,?,?,?,?,1,?,?)",
+                        (fp, plan_id or p.get("proposal_id"), p.get("action"), p.get("entity"),
+                         p.get("canonical_path"), json.dumps(p), now, now),
+                    )
+
+    def get_proposal(self, fingerprint: str) -> Optional[dict]:
+        with self._cursor() as cur:
+            row = cur.execute(
+                "SELECT proposal_json, seen_count FROM proposals WHERE fingerprint = ?", (fingerprint,)
+            ).fetchone()
+        if not row:
+            return None
+        d = json.loads(row["proposal_json"])
+        d["_seen_count"] = row["seen_count"]
+        return d
+
+    def list_proposals_by_action(self, action: str) -> list[dict]:
+        with self._cursor() as cur:
+            rows = cur.execute("SELECT proposal_json FROM proposals WHERE action = ?", (action,)).fetchall()
+        return [json.loads(r["proposal_json"]) for r in rows]
+
+    # ---- Phase 8: transaction ledger, events, per-path locks --------------
+
+    def record_transaction(self, transaction_id: str, plan_id: Optional[str],
+                            proposal_fingerprint: str, entity: Optional[str],
+                            canonical_path: Optional[str], action: Optional[str],
+                            mode: str, state: str, enforcer_state: Optional[str] = None,
+                            pre_hash: Optional[str] = None) -> None:
+        now = time.time()
+        with self._cursor() as cur:
+            cur.execute(
+                "INSERT INTO transactions (transaction_id, plan_id, proposal_fingerprint, entity, "
+                "canonical_path, action, mode, state, enforcer_state, pre_hash, post_hash, error, "
+                "created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,NULL,NULL,?,?) "
+                "ON CONFLICT(transaction_id) DO UPDATE SET state=excluded.state, "
+                "enforcer_state=excluded.enforcer_state, updated_at=excluded.updated_at",
+                (transaction_id, plan_id, proposal_fingerprint, entity, canonical_path, action,
+                 mode, state, enforcer_state, pre_hash, now, now),
+            )
+
+    def update_transaction(self, transaction_id: str, *, state: Optional[str] = None,
+                            enforcer_state: Optional[str] = None, pre_hash: Optional[str] = None,
+                            post_hash: Optional[str] = None, error: Optional[str] = None) -> None:
+        now = time.time()
+        existing = self.get_transaction(transaction_id)
+        if existing is None:
+            raise KeyError(transaction_id)
+        with self._cursor() as cur:
+            cur.execute(
+                "UPDATE transactions SET "
+                "state = COALESCE(?, state), "
+                "enforcer_state = COALESCE(?, enforcer_state), "
+                "pre_hash = COALESCE(?, pre_hash), "
+                "post_hash = COALESCE(?, post_hash), "
+                "error = COALESCE(?, error), "
+                "updated_at = ? WHERE transaction_id = ?",
+                (state, enforcer_state, pre_hash, post_hash, error, now, transaction_id),
+            )
+
+    def get_transaction(self, transaction_id: str) -> Optional[dict]:
+        with self._cursor() as cur:
+            row = cur.execute(
+                "SELECT * FROM transactions WHERE transaction_id = ?", (transaction_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    _TERMINAL_TRANSACTION_STATES = {
+        "COMMITTED", "ALREADY_APPLIED", "NO_CHANGE_NOOP", "NOT_APPLICABLE",
+        "BLOCKED", "VALIDATION_FAILED", "STALE", "ROLLED_BACK", "ROLLBACK_FAILED",
+        "DRY_RUN_VALIDATED", "RECOVERY_REQUIRED",
+    }
+
+    def list_incomplete_transactions(self) -> list[dict]:
+        """Transactions that never reached a terminal FREYA-level state --
+        the restart-safety inspection point. Never blindly replayed; the
+        caller (executor) must inspect current canonical hash before
+        deciding anything."""
+        placeholders = ",".join("?" for _ in self._TERMINAL_TRANSACTION_STATES)
+        with self._cursor() as cur:
+            rows = cur.execute(
+                f"SELECT * FROM transactions WHERE state NOT IN ({placeholders})",
+                tuple(self._TERMINAL_TRANSACTION_STATES),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_committed_transaction_for_fingerprint(self, fingerprint: str) -> Optional[dict]:
+        with self._cursor() as cur:
+            row = cur.execute(
+                "SELECT * FROM transactions WHERE proposal_fingerprint = ? AND state = 'COMMITTED' "
+                "ORDER BY created_at DESC LIMIT 1",
+                (fingerprint,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def record_transaction_event(self, transaction_id: str, event: str,
+                                  result: Optional[str] = None, detail: Optional[dict] = None) -> None:
+        now = time.time()
+        with self._cursor() as cur:
+            cur.execute(
+                "INSERT INTO transaction_events (transaction_id, event, result, detail_json, created_at) "
+                "VALUES (?,?,?,?,?)",
+                (transaction_id, event, result, json.dumps(detail) if detail is not None else None, now),
+            )
+
+    def get_transaction_events(self, transaction_id: str) -> list[dict]:
+        with self._cursor() as cur:
+            rows = cur.execute(
+                "SELECT * FROM transaction_events WHERE transaction_id = ? ORDER BY id ASC",
+                (transaction_id,),
+            ).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["detail"] = json.loads(d["detail_json"]) if d.get("detail_json") else None
+            out.append(d)
+        return out
+
+    def acquire_path_lock(self, canonical_path: str, transaction_id: str) -> bool:
+        """Per-path concurrency guard. INSERT with a PRIMARY KEY collision
+        is the lock-contention signal -- a second transaction targeting the
+        same canonical_path fails to acquire and must not proceed."""
+        now = time.time()
+        try:
+            with self._cursor() as cur:
+                cur.execute(
+                    "INSERT INTO path_locks (canonical_path, transaction_id, locked_at) VALUES (?,?,?)",
+                    (canonical_path, transaction_id, now),
+                )
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def release_path_lock(self, canonical_path: str, transaction_id: str) -> None:
+        with self._cursor() as cur:
+            cur.execute(
+                "DELETE FROM path_locks WHERE canonical_path = ? AND transaction_id = ?",
+                (canonical_path, transaction_id),
+            )
+
+    def get_path_lock(self, canonical_path: str) -> Optional[dict]:
+        with self._cursor() as cur:
+            row = cur.execute(
+                "SELECT * FROM path_locks WHERE canonical_path = ?", (canonical_path,)
+            ).fetchone()
+        return dict(row) if row else None
 
     def health(self) -> dict:
         with self._cursor() as cur:

@@ -16,9 +16,16 @@ import logging
 from pathlib import Path
 from typing import Optional
 
+import uuid
+
 from .classifier import classify, scan_for_secrets
 from .entity_resolver import resolve_entity
 from .knowledge_extractor import extract_knowledge, EXTRACTOR_VERSION
+from .relationship_engine import (
+    facts_to_candidates, evaluate_candidate, relationship_fingerprint,
+    build_relationship_conflict_packet,
+)
+from .canonical_planner import build_plan
 from .state_store import FreyaStateStore
 
 log = logging.getLogger("freya.pipeline")
@@ -34,6 +41,18 @@ _MAX_CONTENT_BYTES = 500_000
 # fully function with zero live vault connection (see knowledge_extractor
 # module docstring for why none is wired in this build pass).
 CANONICAL_LOOKUP = None
+
+# Optional hook: Layer 6's "existing graph awareness" (recognizing a
+# relationship that's already a real wikilink in the vault, per spec).
+# Architecturally supported, not fed real vault state by default -- same
+# reasoning as CANONICAL_LOOKUP above.
+CANONICAL_RELATIONSHIP_LOOKUP = None
+
+# Optional hook: Layer 7's canonical_reader callable, (canonical_path) ->
+# Optional[str] of the current canonical note text. None by default -- the
+# real production pipeline is a background daemon with no live vault
+# reader wired in by default (see canonical_planner.py module docstring).
+CANONICAL_READER = None
 
 
 def _read_content_if_safe(abspath: Path, category: str) -> str | None:
@@ -95,6 +114,12 @@ def _run_extraction(rel: str, entities: list[str], category: str, content: Optio
             overall_status = "NEEDS_REVIEW"
             escalation_packet = escalation_packet or result.escalation
 
+    # --- Layer 6: relationship engine, Layer 7: canonical change planner ---
+    # Both run every pass regardless of Layer 5's overall_status -- a
+    # Layer 5 escalation on one fact doesn't block planning for the rest.
+    resolved_relationships = _run_relationship_engine(rel, merged_facts, store)
+    _run_canonical_planner(rel, entities, merged_facts, resolved_relationships, store)
+
     conf_rank = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
     overall_confidence = max(confidences, key=lambda c: conf_rank[c]) if confidences else "LOW"
 
@@ -122,6 +147,62 @@ def _run_extraction(rel: str, entities: list[str], category: str, content: Optio
         escalation_reason=(escalation_packet.get("reason") if escalation_packet
                             else "awaiting Layer 6 (relationship engine)"),
     )
+
+
+def _run_relationship_engine(rel: str, facts: list[dict], store: FreyaStateStore) -> list[dict]:
+    """
+    Layer 6 hook. Translates this pass's Layer 5 facts into relationship
+    candidates and evaluates each against FREYA's persisted relationship
+    ledger (ADD / CONFIRM / SUPERSEDE_AND_ADD / CONFLICT / NEEDS_REVIEW --
+    see relationship_engine.evaluate_candidate). Returns the ACTIVE +
+    SUPERSEDED rows touched this pass, in the shape Layer 7's
+    plan_relationship expects (source_entity/rel_type/target/...).
+
+    NEEDS_REVIEW (LOW confidence) candidates are never persisted as a
+    graph edge, per spec -- review-only, not canonical-track.
+    """
+    candidates = facts_to_candidates(facts)
+    resolved: list[dict] = []
+    for candidate in candidates:
+        fp = relationship_fingerprint(candidate.source, candidate.rel_type, candidate.target)
+        existing_exact = store.get_relationship_by_fingerprint(fp)
+        existing_for_source = store.get_active_relationships_for_source(candidate.source)
+        result = evaluate_candidate(candidate, existing_exact, existing_for_source)
+
+        if result.action == "ADD":
+            resolved.append(store.upsert_relationship(candidate, status="ACTIVE", source_path=rel))
+        elif result.action == "CONFIRM":
+            resolved.append(store.confirm_relationship(result.fingerprint, candidate, source_path=rel))
+        elif result.action == "SUPERSEDE_AND_ADD":
+            for old in result.supersedes:
+                store.mark_relationship_superseded(old["fingerprint"])
+            resolved.append(store.upsert_relationship(candidate, status="ACTIVE", source_path=rel))
+            for old in result.supersedes:
+                superseded_row = store.get_relationship_by_fingerprint(old["fingerprint"])
+                if superseded_row:
+                    resolved.append(superseded_row)
+        elif result.action == "CONFLICT":
+            packet = build_relationship_conflict_packet(
+                candidate, result.conflicts_with, sources=list(candidate.source_files or []) + [rel],
+            )
+            store.record_relationship_conflict(packet)
+        # NEEDS_REVIEW: LOW confidence -- deliberately not persisted as an edge.
+    return resolved
+
+
+def _run_canonical_planner(rel: str, entities: list[str], facts: list[dict],
+                            resolved_relationships: list[dict], store: FreyaStateStore) -> None:
+    """
+    Layer 7 hook. Builds a Layer 7 change plan from this pass's Layer 5
+    facts and Layer 6's resolved relationship records, then persists the
+    plan and its proposals to FREYA's own SQLite state (plans/proposals
+    tables) -- never a canonical write. See canonical_planner.py: PLAN
+    ONLY, nothing here or reachable from here touches Notion/**.
+    """
+    plan_id = f"plan-{uuid.uuid4().hex[:12]}"
+    plan = build_plan(plan_id, facts, resolved_relationships, rel, canonical_reader=CANONICAL_READER)
+    store.record_plan(plan, source_file=rel)
+    store.record_proposals(plan["proposals"], plan_id=plan_id)
 
 
 def handle_file(abspath: Path, rel: str, event_kind: str, store: FreyaStateStore) -> None:
