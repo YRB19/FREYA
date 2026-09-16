@@ -68,6 +68,23 @@ def test_historical_architecture():
     print("PASS: historical architecture -> HISTORICAL/SUPERSEDED, not current")
 
 
+def test_historical_architecture_adr_style_phrasing():
+    # Real-ecosystem validation caught this: the live ResearchOS note's
+    # actual phrasing didn't match the narrower "previously used X"
+    # pattern at all, so the flagship ResearchOS/n8n historical fact was
+    # silently missed. Regression-tests the exact real phrasing.
+    result = extract_knowledge(
+        "ResearchOS", "ResearchOS/ResearchOS.md", "h3b",
+        "ADR-001 originally specified n8n-based hosting/orchestration for ResearchOS; "
+        "this is now historical/superseded by the current Python-script-on-ATLAS implementation.",
+        "documentation")
+    hist = [f for f in result.facts if f["predicate"] == "PREVIOUSLY_USED"]
+    assert hist, "ADR-style 'originally specified...now historical/superseded' phrasing was not extracted"
+    assert hist[0]["object"] == "n8n"
+    assert hist[0]["temporal_status"] == "HISTORICAL"
+    print("PASS: ADR-style historical phrasing ('originally specified X...now superseded') is extracted")
+
+
 def test_planned_work():
     result = extract_knowledge("FREYA", "FREYA/README.md", "h4",
                                 "We plan to add specialist agents.",
@@ -253,6 +270,7 @@ if __name__ == "__main__":
     test_project_documentation()
     test_current_runtime()
     test_historical_architecture()
+    test_historical_architecture_adr_style_phrasing()
     test_planned_work()
     test_explicit_decision()
     test_bug_and_fix()
