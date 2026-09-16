@@ -326,6 +326,20 @@ def _extract_from_prose(entity: str, content: str, category: str) -> list[Fact]:
                                      temporal_override="HISTORICAL", evidence_type="HISTORICAL_STATE", confidence=conf,
                                      excerpt=sentence, sentence=sentence))
 
+        # Broader ADR-style historical marker: "X originally specified/used
+        # Y[-based] ..." — a generalizable pattern (common in decision-
+        # record prose), not narrowly fit to one sentence. Caught missing
+        # by real-ecosystem validation: the live vault's actual ResearchOS
+        # note uses exactly this phrasing ("ADR-001 originally specified
+        # n8n-based hosting/orchestration..."), which the narrower
+        # "previously used X" pattern above didn't match at all — a real
+        # false negative on the flagship supersession example.
+        m = re.search(r"(?i)originally\s+(?:specified|used|had)\s+(?P<obj>[\w][\w\-]*?)(?:-based)?\b", sentence)
+        if m and re.search(r"(?i)\b(historical|superseded)\b", sentence):
+            facts.append(_make_fact(entity, "ARCHITECTURE", "PREVIOUSLY_USED", m.group("obj"),
+                                     temporal_override="HISTORICAL", evidence_type="HISTORICAL_STATE", confidence=conf,
+                                     excerpt=sentence, sentence=sentence))
+
         if re.search(r"(?i)\bwas replaced\b", sentence):
             facts.append(_make_fact(entity, "ARCHITECTURE", "SUPERSEDED_BY", sentence,
                                      temporal_override="SUPERSEDED", evidence_type="HISTORICAL_STATE", confidence=conf,

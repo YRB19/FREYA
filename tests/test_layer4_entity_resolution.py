@@ -4,7 +4,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from freya.entity_resolver import resolve_entity, known_entity_names
+from freya.entity_resolver import resolve_entity, known_entity_names, canonical_path_for_entity
 from freya.state_store import FreyaStateStore, hash_file
 from freya.pipeline import handle_file
 
@@ -147,6 +147,19 @@ def test_no_llm_dependency_for_routine_cases():
     print("PASS: entity resolver has zero LLM/network dependency for routine cases")
 
 
+def test_canonical_path_for_entity_known_and_unknown():
+    # Regression: canonical_path_for_entity() was referenced by Layer 7's
+    # canonical_planner.py but missing from entity_resolver.py entirely
+    # (ImportError on import). Reads the same ENTITY_REGISTRY.vault_note
+    # field Layer 4 already uses -- no filename-similarity guessing, no
+    # invented paths for an unregistered entity.
+    for entity in known_entity_names():
+        path = canonical_path_for_entity(entity)
+        assert path is not None, f"registered entity {entity!r} must resolve to a canonical path"
+    assert canonical_path_for_entity("NotARealEntity") is None
+    print("PASS: canonical_path_for_entity resolves every registered entity, invents nothing for unknown ones")
+
+
 if __name__ == "__main__":
     setup()
     test_obvious_usageos()
@@ -162,4 +175,5 @@ if __name__ == "__main__":
     test_scene_map_distinct_from_studioos_project()
     test_clipos_logs_root_level_file()
     test_no_llm_dependency_for_routine_cases()
+    test_canonical_path_for_entity_known_and_unknown()
     print(f"\nALL LAYER 4 TESTS PASSED — registry covers {len(known_entity_names())} entities")
