@@ -200,7 +200,7 @@ def _run_canonical_planner(rel: str, entities: list[str], facts: list[dict],
     ONLY, nothing here or reachable from here touches Notion/**.
     """
     plan_id = f"plan-{uuid.uuid4().hex[:12]}"
-    plan = build_plan(plan_id, facts, resolved_relationships, rel, canonical_reader=CANONICAL_READER)
+    plan = build_plan(plan_id, facts, resolved_relationships, rel, canonical_reader=CANONICAL_READER, origin="PRODUCTION")
     store.record_plan(plan, source_file=rel)
     store.record_proposals(plan["proposals"], plan_id=plan_id)
 
