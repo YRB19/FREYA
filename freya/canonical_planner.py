@@ -416,6 +416,7 @@ def build_plan(
     source_file: str,
     *,
     canonical_reader: Optional[Callable[[str], Optional[str]]] = None,
+    origin: Optional[str] = None,
 ) -> dict:
     """
     Top-level entry point: facts (Layer 5) + relationships (Layer 6,
@@ -445,9 +446,17 @@ def build_plan(
     for p in proposals:
         summary[p.action] = summary.get(p.action, 0) + 1
 
+    # Normalized here for serialization consistency only. The persisted
+    # `plans.origin` DB column (see state_store.record_plan/get_plan) is
+    # the authoritative value canonical_executor's origin gate actually
+    # checks at execution time -- never this JSON copy alone. Never
+    # defaults an unrecognized/missing value to PRODUCTION.
+    normalized_origin = origin if origin in ("PRODUCTION", "VALIDATION") else "UNKNOWN"
+
     return {
         "plan_id": plan_id,
         "generated_at": time.time(),
+        "origin": normalized_origin,
         "input_snapshot": {"source_file": source_file, "fact_count": len(facts),
                             "relationship_count": len(relationships)},
         "proposals": [p.to_dict() for p in proposals],
