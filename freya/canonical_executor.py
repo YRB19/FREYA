@@ -46,6 +46,30 @@ WRITE_ACTIONS = {
 }
 NO_WRITE_ACTIONS = {"NO_CHANGE", "ESCALATE", "BLOCKED"}
 
+# Plan-origin safety gate (Phase 8 operational-integration change). A plan
+# is either explicitly PRODUCTION or explicitly VALIDATION; anything else
+# (missing, null, empty, misspelled, lowercase, "test", etc.) is treated
+# as unknown and fails closed. This is intentionally strict and exact --
+# no case-folding, no aliasing -- so a typo can never silently widen what
+# is APPLYable. See state_store.record_plan/get_plan for how `origin` is
+# persisted and read back as the authoritative value.
+ORIGIN_PRODUCTION = "PRODUCTION"
+ORIGIN_VALIDATION = "VALIDATION"
+VALID_ORIGINS = (ORIGIN_PRODUCTION, ORIGIN_VALIDATION)
+
+
+def _origin_block_reason(origin: Optional[str], mode: str) -> Optional[str]:
+    """Returns None if execution in this mode is allowed for this origin,
+    else a short machine-readable block reason. Required behavior:
+      DRY_RUN: PRODUCTION -> allowed, VALIDATION -> allowed, anything else -> BLOCKED
+      APPLY:   PRODUCTION -> allowed, VALIDATION -> BLOCKED,  anything else -> BLOCKED
+    An unrecognized origin is NEVER treated as PRODUCTION."""
+    if origin not in VALID_ORIGINS:
+        return "ORIGIN_UNKNOWN_OR_MISSING"
+    if mode == MODE_APPLY and origin != ORIGIN_PRODUCTION:
+        return "ORIGIN_VALIDATION_APPLY_BLOCKED"
+    return None
+
 REQUIRED_PROPOSAL_FIELDS = (
     "proposal_id", "action", "entity", "canonical_path", "section",
     "proposed_content", "reason", "evidence", "provenance",
@@ -178,7 +202,7 @@ class CanonicalExecutor:
     def _event(self, tx_id, event, result=None, detail=None):
         self.store.record_transaction_event(tx_id, event, result=result, detail=detail)
 
-    def execute_proposal(self, proposal: dict, mode: str = MODE_DRY_RUN) -> dict:
+    def execute_proposal(self, proposal: dict, mode: str = MODE_DRY_RUN, _plan: Optional[dict] = None) -> dict:
         """Executes a single Phase 7 proposal. Returns a result dict with
         at least {"status": ..., "transaction_id": ...}. Never raises for
         ordinary validation/safety failures -- those are reported as a
@@ -204,6 +228,24 @@ class CanonicalExecutor:
         err = validate_proposal_schema(proposal)
         if err:
             return fail("VALIDATION_FAILED", err)
+
+        # Plan-origin gate: the highest safe boundary after minimal shape
+        # validation (so a malformed dict is still reported as malformed,
+        # not as an origin failure). `_plan` is supplied internally by
+        # execute_plan, which has already resolved and origin-checked the
+        # whole plan once; a caller invoking execute_proposal directly
+        # (bypassing execute_plan) has no such context, so it is resolved
+        # here from the real persisted record -- the same authoritative
+        # source execute_plan itself uses -- and CANNOT be overridden by
+        # anything the caller passes inside `proposal` itself.
+        if _plan is not None:
+            origin = _plan.get("origin")
+        else:
+            plan_id = self.store.get_proposal_plan_id(fingerprint) if fingerprint else None
+            origin = self.store.get_plan_origin(plan_id) if plan_id else None
+        origin_block = _origin_block_reason(origin, mode)
+        if origin_block is not None:
+            return fail("BLOCKED", origin_block)
 
         if action in NO_WRITE_ACTIONS:
             self.store.update_transaction(tx_id, state="NOT_APPLICABLE")
@@ -455,6 +497,17 @@ class CanonicalExecutor:
         -- no partial graph corruption from applying a change on top of a
         failed prerequisite."""
         proposals = {p["proposal_id"]: p for p in plan.get("proposals", [])}
+
+        # Plan-origin gate, checked once for the whole plan before
+        # touching any proposal: a VALIDATION or unknown-origin plan is
+        # refused for APPLY (and unknown-origin is refused even for
+        # DRY_RUN) without ever calling execute_proposal, the real
+        # enforcer, or the real MCP adapter for any of its proposals.
+        origin_block = _origin_block_reason(plan.get("origin"), mode)
+        if origin_block is not None:
+            return [{"status": "BLOCKED", "proposal_id": pid, "reason": origin_block,
+                      "transaction_id": None} for pid in proposals]
+
         order = self._topological_order(proposals)
         results = []
         blocked_ids: set = set()
@@ -466,7 +519,7 @@ class CanonicalExecutor:
                                  "reason": "a dependency did not succeed"})
                 blocked_ids.add(pid)
                 continue
-            result = self.execute_proposal(proposal, mode=mode)
+            result = self.execute_proposal(proposal, mode=mode, _plan=plan)
             results.append(result)
             if result["status"] not in ("COMMITTED", "DRY_RUN_VALIDATED", "ALREADY_APPLIED", "NOT_APPLICABLE"):
                 blocked_ids.add(pid)
