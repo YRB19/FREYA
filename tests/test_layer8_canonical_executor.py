@@ -12,6 +12,7 @@ Layer 6's test file is still empty (0 bytes) -- a separate, pre-existing
 gap, not addressed here. These tests exercise Layer 6 persistence only
 indirectly, through Phase 8's own transaction/proposal bookkeeping.
 """
+import json
 import sys
 import time
 import uuid
@@ -108,7 +109,14 @@ def make_proposal(action="APPEND", canonical_path=TEST_PATH, entity=TEST_ENTITY,
     return proposal
 
 
-def persist(store, proposal, plan_id="plan-test"):
+def persist(store, proposal, plan_id="plan-test", origin="PRODUCTION"):
+    """Persists a proposal AND its parent plan (with the given origin) so
+    the Phase 8 origin gate can resolve it. Defaults to PRODUCTION since
+    the overwhelming majority of this suite exercises ordinary production
+    execution; VALIDATION/UNKNOWN-origin behavior gets its own dedicated
+    tests further down rather than changing this default."""
+    store.record_plan({"plan_id": plan_id, "origin": origin, "proposals": [proposal]},
+                       source_file=proposal.get("canonical_path"))
     store.record_proposals([proposal], plan_id=plan_id)
 
 
@@ -258,9 +266,10 @@ def test_fingerprint_mismatch_blocked():
 
 def test_unknown_fingerprint_blocked():
     ex, store, mcp = new_executor()
-    proposal = make_proposal()  # never persisted via record_proposals
+    proposal = make_proposal()  # never persisted -- no parent plan to resolve
     result = ex.execute_proposal(proposal, mode=MODE_APPLY)
-    check("unpersisted/unknown fingerprint -> VALIDATION_FAILED", result["status"] == "VALIDATION_FAILED")
+    check("unpersisted proposal / missing parent plan -> BLOCKED", result["status"] == "BLOCKED")
+    check("missing parent plan reason is origin-related", result.get("reason") == "ORIGIN_UNKNOWN_OR_MISSING")
 
 
 # 14. Dependency ordering -----------------------------------------------------
@@ -279,7 +288,7 @@ def test_dependency_ordering_skips_dependents_on_failure():
     p2["depends_on"] = ["p1"]
     persist(store, p1)
     persist(store, p2)
-    plan = {"plan_id": "plan-dep", "proposals": [p1, p2]}
+    plan = {"plan_id": "plan-dep", "origin": "PRODUCTION", "proposals": [p1, p2]}
     results = ex.execute_plan(plan, mode=MODE_APPLY)
     by_id = {r["proposal_id"]: r["status"] for r in results}
     check("failed dependency itself is BLOCKED", by_id.get("p1") == "BLOCKED")
@@ -297,7 +306,7 @@ def test_dependency_ordering_proceeds_when_dependency_is_legitimate_noop():
     p2["depends_on"] = ["p1"]
     persist(store, p1)
     persist(store, p2)
-    plan = {"plan_id": "plan-dep2", "proposals": [p1, p2]}
+    plan = {"plan_id": "plan-dep2", "origin": "PRODUCTION", "proposals": [p1, p2]}
     results = ex.execute_plan(plan, mode=MODE_APPLY)
     by_id = {r["proposal_id"]: r["status"] for r in results}
     check("dependent of a legitimate no-op still executes", by_id.get("p2") == "COMMITTED")
@@ -407,7 +416,7 @@ def test_dry_run_batch_zero_writes():
     p2 = make_proposal(fingerprint="fp-b2", proposed_content="- another fact")
     persist(store, p1)
     persist(store, p2)
-    plan = {"plan_id": "plan-batch", "proposals": [p1, p2]}
+    plan = {"plan_id": "plan-batch", "origin": "PRODUCTION", "proposals": [p1, p2]}
     results = ex.execute_plan(plan, mode=MODE_DRY_RUN)
     check("batch dry-run all DRY_RUN_VALIDATED", all(r["status"] == "DRY_RUN_VALIDATED" for r in results))
     check("batch dry-run leaves content untouched", mcp.files[TEST_PATH] == "## Notes\nExisting content.\n")
@@ -487,6 +496,169 @@ def test_unrelated_markdown_untouched():
     check("unrelated Purpose section preserved", "Some purpose text." in mcp.files[TEST_PATH])
 
 
+# 31-48. Plan-origin safety gate ---------------------------------------------
+
+def test_origin_production_dry_run_allowed():
+    ex, store, mcp = new_executor(initial_files={TEST_PATH: "## Notes\nExisting content.\n"})
+    proposal = make_proposal(fingerprint="fp-origin-1")
+    persist(store, proposal, plan_id="plan-origin-1", origin="PRODUCTION")
+    result = ex.execute_proposal(proposal, mode=MODE_DRY_RUN)
+    check("PRODUCTION + DRY_RUN -> allowed", result["status"] == "DRY_RUN_VALIDATED")
+
+
+def test_origin_validation_dry_run_allowed():
+    ex, store, mcp = new_executor(initial_files={TEST_PATH: "## Notes\nExisting content.\n"})
+    proposal = make_proposal(fingerprint="fp-origin-2")
+    persist(store, proposal, plan_id="plan-origin-2", origin="VALIDATION")
+    result = ex.execute_proposal(proposal, mode=MODE_DRY_RUN)
+    check("VALIDATION + DRY_RUN -> allowed", result["status"] == "DRY_RUN_VALIDATED")
+
+
+def test_origin_production_apply_allowed_to_proceed():
+    ex, store, mcp = new_executor(initial_files={TEST_PATH: "## Notes\nExisting content.\n"})
+    proposal = make_proposal(fingerprint="fp-origin-3")
+    persist(store, proposal, plan_id="plan-origin-3", origin="PRODUCTION")
+    result = ex.execute_proposal(proposal, mode=MODE_APPLY)
+    check("PRODUCTION + APPLY -> proceeds past the origin gate", result["status"] == "COMMITTED")
+
+
+def test_origin_validation_apply_blocked():
+    ex, store, mcp = new_executor(initial_files={TEST_PATH: "## Notes\nExisting content.\n"})
+    proposal = make_proposal(fingerprint="fp-origin-4")
+    persist(store, proposal, plan_id="plan-origin-4", origin="VALIDATION")
+    result = ex.execute_proposal(proposal, mode=MODE_APPLY)
+    check("VALIDATION + APPLY -> BLOCKED", result["status"] == "BLOCKED")
+    check("VALIDATION + APPLY reason is origin-related", result.get("reason") == "ORIGIN_VALIDATION_APPLY_BLOCKED")
+    check("VALIDATION + APPLY performs no write", "New fact from test" not in mcp.files[TEST_PATH])
+
+
+def test_origin_unknown_dry_run_blocked():
+    ex, store, mcp = new_executor(initial_files={TEST_PATH: "## Notes\nExisting content.\n"})
+    proposal = make_proposal(fingerprint="fp-origin-5")
+    persist(store, proposal, plan_id="plan-origin-5", origin="not-a-real-origin")
+    result = ex.execute_proposal(proposal, mode=MODE_DRY_RUN)
+    check("UNKNOWN/missing origin + DRY_RUN -> BLOCKED", result["status"] == "BLOCKED")
+
+
+def test_origin_unknown_apply_blocked():
+    ex, store, mcp = new_executor(initial_files={TEST_PATH: "## Notes\nExisting content.\n"})
+    proposal = make_proposal(fingerprint="fp-origin-6")
+    persist(store, proposal, plan_id="plan-origin-6", origin="not-a-real-origin")
+    result = ex.execute_proposal(proposal, mode=MODE_APPLY)
+    check("UNKNOWN/missing origin + APPLY -> BLOCKED", result["status"] == "BLOCKED")
+
+
+def test_origin_null_blocked():
+    ex, store, mcp = new_executor(initial_files={TEST_PATH: "## Notes\nExisting content.\n"})
+    proposal = make_proposal(fingerprint="fp-origin-7")
+    persist(store, proposal, plan_id="plan-origin-7", origin=None)
+    result = ex.execute_proposal(proposal, mode=MODE_APPLY)
+    check("NULL origin -> BLOCKED (never defaulted to PRODUCTION)", result["status"] == "BLOCKED")
+
+
+def test_origin_malformed_blocked():
+    ex, store, mcp = new_executor(initial_files={TEST_PATH: "## Notes\nExisting content.\n"})
+    proposal = make_proposal(fingerprint="fp-origin-8")
+    for bad in ("", "production", "PRODUCTION ", "Validation", "TEST"):
+        persist(store, proposal, plan_id="plan-origin-8", origin=bad)
+        result = ex.execute_proposal(proposal, mode=MODE_APPLY)
+        check(f"malformed origin {bad!r} -> BLOCKED", result["status"] == "BLOCKED")
+
+
+def test_origin_missing_parent_plan_blocked():
+    ex, store, mcp = new_executor()
+    proposal = make_proposal(fingerprint="fp-origin-9")
+    store.record_proposals([proposal], plan_id="plan-that-does-not-exist")
+    result = ex.execute_proposal(proposal, mode=MODE_APPLY)
+    check("proposal whose parent plan cannot be resolved -> BLOCKED", result["status"] == "BLOCKED")
+
+
+def test_origin_proposal_cannot_bypass_plan_origin_via_execute_plan():
+    ex, store, mcp = new_executor(initial_files={TEST_PATH: "## Notes\nExisting content.\n"})
+    proposal = make_proposal(fingerprint="fp-origin-10")
+    persist(store, proposal, plan_id="plan-origin-10", origin="VALIDATION")
+    plan = {"plan_id": "plan-origin-10", "origin": "VALIDATION", "proposals": [proposal]}
+    results = ex.execute_plan(plan, mode=MODE_APPLY)
+    check("individual proposal cannot bypass parent VALIDATION origin via execute_plan",
+          all(r["status"] == "BLOCKED" for r in results))
+
+
+def test_origin_validation_append_proposal_cannot_apply():
+    ex, store, mcp = new_executor(initial_files={TEST_PATH: "## Notes\nExisting content.\n"})
+    proposal = make_proposal(fingerprint="fp-origin-11", action="APPEND")
+    persist(store, proposal, plan_id="plan-origin-11", origin="VALIDATION")
+    result = ex.execute_proposal(proposal, mode=MODE_APPLY)
+    check("VALIDATION plan with ADD/APPEND proposal still cannot APPLY", result["status"] == "BLOCKED")
+    check("VALIDATION APPEND performs no write", "New fact from test" not in mcp.files[TEST_PATH])
+
+
+def test_origin_validation_supersede_proposal_cannot_apply():
+    ex, store, mcp = new_executor(initial_files={
+        TEST_PATH: "## Relationships\n- [[n8n]] (ORCHESTRATED_BY) -- current\n"
+    })
+    proposal = make_proposal(
+        fingerprint="fp-origin-12", action="MARK_SUPERSEDED", section="Relationships",
+        current_content="## Relationships\n- [[n8n]] (ORCHESTRATED_BY) -- current\n",
+        proposed_content="- [[n8n]] (ORCHESTRATED_BY) -- HISTORICAL",
+    )
+    persist(store, proposal, plan_id="plan-origin-12", origin="VALIDATION")
+    result = ex.execute_proposal(proposal, mode=MODE_APPLY)
+    check("VALIDATION plan with a REMOVE/supersede-shaped proposal cannot APPLY", result["status"] == "BLOCKED")
+    check("VALIDATION supersede performs no write", "HISTORICAL" not in mcp.files[TEST_PATH])
+
+
+def test_origin_survives_serialization_roundtrip():
+    store = make_store()
+    proposal = make_proposal(fingerprint="fp-origin-13")
+    plan_dict = {"plan_id": "plan-origin-13", "origin": "VALIDATION", "proposals": [proposal]}
+    store.record_plan(plan_dict, source_file=TEST_PATH)
+    reloaded = store.get_plan("plan-origin-13")
+    check("origin survives record_plan/get_plan round-trip", reloaded["origin"] == "VALIDATION")
+    json_roundtrip = json.loads(json.dumps(plan_dict))
+    check("origin survives plain JSON serialization", json_roundtrip["origin"] == "VALIDATION")
+
+
+def test_origin_migration_preserves_existing_plan_data():
+    store = make_store()
+    with store._cursor() as cur:
+        cur.execute("INSERT INTO plans (plan_id, source_file, plan_json, created_at) VALUES (?,?,?,?)",
+                    ("plan-pre-existing", "Notion/Old.md",
+                     json.dumps({"plan_id": "plan-pre-existing", "proposals": []}), 0.0))
+    check("plan predating the origin column is UNKNOWN, never PRODUCTION",
+          store.get_plan_origin("plan-pre-existing") == "UNKNOWN")
+    check("pre-existing plan data is otherwise untouched",
+          store.get_plan("plan-pre-existing")["plan_id"] == "plan-pre-existing")
+
+
+def test_origin_dry_run_still_zero_writes_for_production():
+    ex, store, mcp = new_executor(initial_files={TEST_PATH: "## Notes\nExisting content.\n"})
+    proposal = make_proposal(fingerprint="fp-origin-14")
+    persist(store, proposal, plan_id="plan-origin-14", origin="PRODUCTION")
+    ex.execute_proposal(proposal, mode=MODE_DRY_RUN)
+    check("origin gate does not affect dry-run's zero-write guarantee",
+          mcp.files[TEST_PATH] == "## Notes\nExisting content.\n")
+
+
+def test_origin_not_mutated_by_executor():
+    ex, store, mcp = new_executor(initial_files={TEST_PATH: "## Notes\nExisting content.\n"})
+    proposal = make_proposal(fingerprint="fp-origin-15")
+    persist(store, proposal, plan_id="plan-origin-15", origin="VALIDATION")
+    ex.execute_proposal(proposal, mode=MODE_APPLY)
+    check("origin cannot be changed implicitly by the executor",
+          store.get_plan_origin("plan-origin-15") == "VALIDATION")
+
+
+def test_origin_caller_cannot_override_validation_with_apply_arg():
+    ex, store, mcp = new_executor(initial_files={TEST_PATH: "## Notes\nExisting content.\n"})
+    proposal = make_proposal(fingerprint="fp-origin-16")
+    persist(store, proposal, plan_id="plan-origin-16", origin="VALIDATION")
+    tampered = dict(proposal)
+    tampered["origin"] = "PRODUCTION"
+    result = ex.execute_proposal(tampered, mode=MODE_APPLY)
+    check("caller cannot override VALIDATION by stuffing origin into the proposal dict",
+          result["status"] == "BLOCKED")
+
+
 # Direct filesystem canonical write is impossible through Phase 8 API -------
 
 def test_no_direct_filesystem_write_path_exists():
@@ -526,6 +698,23 @@ if __name__ == "__main__":
     test_mark_superseded_preserves_historical_text()
     test_unrelated_markdown_untouched()
     test_no_direct_filesystem_write_path_exists()
+    test_origin_production_dry_run_allowed()
+    test_origin_validation_dry_run_allowed()
+    test_origin_production_apply_allowed_to_proceed()
+    test_origin_validation_apply_blocked()
+    test_origin_unknown_dry_run_blocked()
+    test_origin_unknown_apply_blocked()
+    test_origin_null_blocked()
+    test_origin_malformed_blocked()
+    test_origin_missing_parent_plan_blocked()
+    test_origin_proposal_cannot_bypass_plan_origin_via_execute_plan()
+    test_origin_validation_append_proposal_cannot_apply()
+    test_origin_validation_supersede_proposal_cannot_apply()
+    test_origin_survives_serialization_roundtrip()
+    test_origin_migration_preserves_existing_plan_data()
+    test_origin_dry_run_still_zero_writes_for_production()
+    test_origin_not_mutated_by_executor()
+    test_origin_caller_cannot_override_validation_with_apply_arg()
 
     print(f"\n{PASS} passed, {FAIL} failed")
     if FAIL:
