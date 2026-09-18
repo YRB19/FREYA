@@ -119,7 +119,8 @@ CREATE TABLE IF NOT EXISTS plans (
     plan_id        TEXT PRIMARY KEY,
     source_file    TEXT,
     plan_json      TEXT NOT NULL,   -- full build_plan() dict, including all proposals
-    created_at     REAL NOT NULL
+    created_at     REAL NOT NULL,
+    origin         TEXT NOT NULL DEFAULT 'UNKNOWN'  -- PRODUCTION / VALIDATION / UNKNOWN (never inferred as PRODUCTION); enforced at execution by canonical_executor's origin gate
 );
 
 CREATE INDEX IF NOT EXISTS idx_plans_source_file ON plans(source_file);
@@ -255,6 +256,7 @@ class FreyaStateStore:
         self._conn.commit()
         self._migrate_layer4_columns()
         self._migrate_layer5_columns()
+        self._migrate_layer8_origin_column()
 
     def _migrate_layer5_columns(self) -> None:
         """
@@ -292,6 +294,19 @@ class FreyaStateStore:
         for col, coltype in new_columns.items():
             if col not in existing:
                 self._conn.execute(f"ALTER TABLE files ADD COLUMN {col} {coltype}")
+        self._conn.commit()
+
+    def _migrate_layer8_origin_column(self) -> None:
+        """
+        Additive-only migration for the Phase 8 plan-origin safety gate.
+        Adds `plans.origin` if missing, defaulting existing rows to
+        'UNKNOWN' -- never 'PRODUCTION' -- so plans that predate this
+        column are never silently treated as production-authorized.
+        Existing plans/proposals rows and all other tables are untouched.
+        """
+        existing = {row["name"] for row in self._conn.execute("PRAGMA table_info(plans)").fetchall()}
+        if "origin" not in existing:
+            self._conn.execute("ALTER TABLE plans ADD COLUMN origin TEXT NOT NULL DEFAULT 'UNKNOWN'")
         self._conn.commit()
 
     @contextmanager
@@ -653,19 +668,43 @@ class FreyaStateStore:
 
     def record_plan(self, plan: dict, source_file: Optional[str] = None) -> None:
         now = time.time()
+        origin = plan.get("origin")
+        if origin not in ("PRODUCTION", "VALIDATION"):
+            origin = "UNKNOWN"  # never inferred as PRODUCTION -- see canonical_executor origin gate
         with self._cursor() as cur:
             cur.execute(
-                "INSERT INTO plans (plan_id, source_file, plan_json, created_at) VALUES (?,?,?,?) "
-                "ON CONFLICT(plan_id) DO UPDATE SET plan_json=excluded.plan_json",
-                (plan["plan_id"], source_file, json.dumps(plan), now),
+                "INSERT INTO plans (plan_id, source_file, plan_json, created_at, origin) VALUES (?,?,?,?,?) "
+                "ON CONFLICT(plan_id) DO UPDATE SET plan_json=excluded.plan_json, origin=excluded.origin",
+                (plan["plan_id"], source_file, json.dumps(plan), now, origin),
             )
         self.audit(source_file, None, "plan_recorded",
-                   {"plan_id": plan["plan_id"], "proposal_count": len(plan.get("proposals", []))})
+                   {"plan_id": plan["plan_id"], "proposal_count": len(plan.get("proposals", [])), "origin": origin})
 
     def get_plan(self, plan_id: str) -> Optional[dict]:
         with self._cursor() as cur:
-            row = cur.execute("SELECT plan_json FROM plans WHERE plan_id = ?", (plan_id,)).fetchone()
-        return json.loads(row["plan_json"]) if row else None
+            row = cur.execute("SELECT plan_json, origin FROM plans WHERE plan_id = ?", (plan_id,)).fetchone()
+        if not row:
+            return None
+        d = json.loads(row["plan_json"])
+        d["origin"] = row["origin"]  # DB column is authoritative, overrides whatever plan_json may say
+        return d
+
+    def get_plan_origin(self, plan_id: str) -> Optional[str]:
+        """Authoritative origin lookup used by the canonical_executor
+        origin gate. Returns None (never 'PRODUCTION') if the plan
+        doesn't exist."""
+        with self._cursor() as cur:
+            row = cur.execute("SELECT origin FROM plans WHERE plan_id = ?", (plan_id,)).fetchone()
+        return row["origin"] if row else None
+
+    def get_proposal_plan_id(self, fingerprint: str) -> Optional[str]:
+        """Authoritative FK lookup: which persisted plan does this
+        proposal fingerprint belong to, from the `proposals` table column
+        (not the JSON blob). Returns None if the fingerprint was never
+        persisted."""
+        with self._cursor() as cur:
+            row = cur.execute("SELECT plan_id FROM proposals WHERE fingerprint = ?", (fingerprint,)).fetchone()
+        return row["plan_id"] if row else None
 
     def record_proposals(self, proposals: list[dict], plan_id: Optional[str] = None) -> None:
         """Upsert-by-fingerprint. Re-planning identical inputs increments
