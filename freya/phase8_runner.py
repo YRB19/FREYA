@@ -50,6 +50,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--apply", action="store_true",
                          help="Actually mutate canonical vault state via the real enforcer. "
                               "Without this flag, always runs in DRY_RUN (zero canonical writes).")
+    parser.add_argument("--db-path", default=DEFAULT_DB_PATH,
+                         help="Path to the FREYA state SQLite database.")
     args = parser.parse_args(argv)
 
     mode = MODE_APPLY if args.apply else MODE_DRY_RUN
