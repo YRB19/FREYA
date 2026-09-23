@@ -109,6 +109,15 @@ class ObsidianMCPAdapter:
         content = result.get("content")
         if isinstance(content, list) and content:
             content = content[0].get("text", "")
+        if result.get("isError", False):
+            # Tool-level failure (not a JSON-RPC error): the "content" here
+            # is the server's error text, not file content. A genuine
+            # not-found is a real None (matches the JSON-RPC-level 404
+            # handling above); anything else is an unexpected read failure
+            # and must not be silently treated as the file's content.
+            if isinstance(content, str) and "not found" in content.lower():
+                return None
+            raise McpUnavailable(f"get_vault_file error for {canonical_path!r}: {content!r}")
         return content
 
     def create(self, canonical_path: str, content: str) -> bool:
