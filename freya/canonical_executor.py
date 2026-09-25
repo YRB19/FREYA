@@ -317,14 +317,28 @@ class CanonicalExecutor:
             return fail("BLOCKED", f"canonical read failed: {e}")
 
         planned_snapshot = proposal.get("current_content")
-        if planned_snapshot is not None:
+        if action == "CREATE":
+            # CREATE is only ever planned against an absent target -- Layer 7
+            # never supplies a current_content snapshot for it (there is
+            # nothing to snapshot). If the target now exists, canonical
+            # state changed since planning: this is the stale-plan case,
+            # not a silent overwrite. The real Obsidian create_vault_file
+            # call overwrites an existing file unconditionally, so this
+            # check is load-bearing, not defense in depth.
+            if current_text is not None:
+                self.store.update_transaction(tx_id, state="STALE", pre_hash=_sha256(current_text))
+                self._event(tx_id, "STALE", result="CREATE target now exists; was planned against an absent target")
+                return {"status": "STALE", "transaction_id": tx_id,
+                         "reason": "CREATE target now exists -- canonical state changed since this proposal was planned, refusing to overwrite",
+                         "proposal_id": proposal.get("proposal_id")}
+        elif planned_snapshot is not None:
             if _sha256(planned_snapshot) != _sha256(current_text):
                 self.store.update_transaction(tx_id, state="STALE", pre_hash=_sha256(current_text))
                 self._event(tx_id, "STALE", result="canonical state changed since planning")
                 return {"status": "STALE", "transaction_id": tx_id,
                          "reason": "canonical file changed since this proposal was planned -- not applied, needs replanning",
                          "proposal_id": proposal.get("proposal_id")}
-        elif action != "CREATE" and current_text is None:
+        elif current_text is None:
             return fail("VALIDATION_FAILED", "no planning-time snapshot and target file does not exist -- ambiguous, not applying")
 
         pre_hash = _sha256(current_text)
@@ -447,23 +461,57 @@ class CanonicalExecutor:
             return "secret-like content present in canonical note after write"
         return None
 
-    def _rollback(self, tx_id: str, enf, canonical_path: str, reason: str) -> dict:
-        self.store.update_transaction(tx_id, state="VERIFICATION_FAILED", error=reason)
-        self._event(tx_id, "VERIFICATION_FAILED", result=reason)
+    @staticmethod
+    def _enf_advance(enf, tx_id: str, new_state: str, note: str = "") -> Optional[str]:
+        """Advances the enforcer manifest and returns the manifest's ACTUAL
+        resulting status -- the value transactions.enforcer_state must
+        mirror. A transition the enforcer refuses is not treated as having
+        happened: the caller sees the unchanged status and must not claim
+        the state it wanted."""
         try:
-            enf.update_transaction_state(tx_id, "VALIDATION_FAILED", note=reason)
+            enf.update_transaction_state(tx_id, new_state, note=note)
         except enf.EnforcerError:
             pass
         try:
+            return enf.read_recovery_point(tx_id)["status"]
+        except Exception:
+            return None
+
+    def _rollback(self, tx_id: str, enf, canonical_path: str, reason: str) -> dict:
+        """Executor-driven rollback of a write whose verification failed.
+
+        Enforcer lifecycle on this path:
+            APPLIED -> VALIDATION_FAILED -> RESTORING -> RESTORED -> RESTORE_VALIDATED
+        or, if restoration cannot be completed and independently verified,
+        RESTORE_FAILED (never RESTORE_VALIDATED). A transaction that passed
+        through a failure state can never reach COMPLETE (enforcer guard).
+
+        Restoration is only validated by a FRESH MCP read after the restore
+        operation: the captured pre-state hash for a pre-existing file, or
+        confirmed absence for a file the write newly created. The restore
+        operation's own ok result is never sufficient. transactions.
+        enforcer_state is synchronised to the manifest at every step."""
+        self.store.update_transaction(tx_id, state="VERIFICATION_FAILED", error=reason)
+        self._event(tx_id, "VERIFICATION_FAILED", result=reason)
+        st = self._enf_advance(enf, tx_id, "VALIDATION_FAILED", note=reason)
+        self.store.update_transaction(tx_id, enforcer_state=st)
+
+        try:
             restore = enf.determine_restore_operation(tx_id)
         except enf.EnforcerError as e:
-            self.store.update_transaction(tx_id, state="RECOVERY_REQUIRED", error=str(e))
+            st = self._enf_advance(enf, tx_id, "RESTORE_FAILED", note=f"restore plan unavailable: {e}")
+            self.store.update_transaction(tx_id, state="RECOVERY_REQUIRED", enforcer_state=st, error=str(e))
             self._event(tx_id, "RECOVERY_REQUIRED", result=str(e))
             return {"status": "RECOVERY_REQUIRED", "transaction_id": tx_id,
                      "reason": f"verification failed ({reason}) and restore plan unavailable: {e}"}
 
+        op = restore["operation"]
+        st = self._enf_advance(enf, tx_id, "RESTORING", note=f"rollback after verification failure ({op})")
+        self.store.update_transaction(tx_id, enforcer_state=st)
+        self._event(tx_id, "RESTORING", result=op)
+
         try:
-            if restore["operation"] == "restore_content":
+            if op == "restore_content":
                 ok = self.mcp.overwrite(canonical_path, restore["content"])
             else:
                 ok = self.mcp.delete(canonical_path)
@@ -471,23 +519,53 @@ class CanonicalExecutor:
             ok = False
 
         if not ok:
-            self.store.update_transaction(tx_id, state="ROLLBACK_FAILED")
+            st = self._enf_advance(enf, tx_id, "RESTORE_FAILED", note="restore write failed")
+            self.store.update_transaction(tx_id, state="ROLLBACK_FAILED", enforcer_state=st, error="restore write failed")
             self._event(tx_id, "ROLLBACK_FAILED", result="restore write failed")
             return {"status": "ROLLBACK_FAILED", "transaction_id": tx_id,
                      "reason": f"verification failed ({reason}) and rollback write failed -- RECOVERY_REQUIRED"}
 
+        st = self._enf_advance(enf, tx_id, "RESTORED", note=f"{op} performed; independent verification pending")
+        self.store.update_transaction(tx_id, enforcer_state=st)
+        self._event(tx_id, "RESTORED", result=op)
+
+        # Independent verification through a fresh read. A failed read is
+        # "cannot confirm", never "absent".
         try:
             restored_text = self.mcp.read(canonical_path)
+            read_ok = True
         except Exception:
             restored_text = None
-        if restore["operation"] == "restore_content" and _sha256(restored_text) != _sha256(restore.get("content")):
-            self.store.update_transaction(tx_id, state="ROLLBACK_FAILED")
-            self._event(tx_id, "ROLLBACK_FAILED", result="restored content hash mismatch")
-            return {"status": "ROLLBACK_FAILED", "transaction_id": tx_id,
-                     "reason": f"verification failed ({reason}); rollback completed but restored hash mismatch -- RECOVERY_REQUIRED"}
+            read_ok = False
+        if op == "restore_content":
+            verified = read_ok and _sha256(restored_text) == _sha256(restore.get("content"))
+            fail_msg = "restored content hash mismatch" if read_ok else "could not re-read target to verify restoration"
+            ok_msg = "restored to exact pre-state, hash verified"
+        else:
+            verified = read_ok and restored_text is None
+            fail_msg = "target still present after delete" if read_ok else "could not re-read target to confirm it is absent"
+            ok_msg = "created target deleted; fresh MCP read confirms it is absent"
 
-        self.store.update_transaction(tx_id, state="ROLLED_BACK")
-        self._event(tx_id, "ROLLED_BACK", result="restored to exact pre-state, hash verified")
+        if not verified:
+            st = self._enf_advance(enf, tx_id, "RESTORE_FAILED", note=fail_msg)
+            self.store.update_transaction(tx_id, state="ROLLBACK_FAILED", enforcer_state=st, error=fail_msg)
+            self._event(tx_id, "ROLLBACK_FAILED", result=fail_msg)
+            return {"status": "ROLLBACK_FAILED", "transaction_id": tx_id,
+                     "reason": f"verification failed ({reason}); rollback did not verify: {fail_msg} -- RECOVERY_REQUIRED"}
+
+        st = self._enf_advance(enf, tx_id, "RESTORE_VALIDATED", note=ok_msg)
+        if st != "RESTORE_VALIDATED":
+            msg = f"restoration verified but the enforcer could not attest it (manifest status {st})"
+            self.store.update_transaction(tx_id, state="RECOVERY_REQUIRED", enforcer_state=st, error=msg)
+            self._event(tx_id, "RECOVERY_REQUIRED", result=msg)
+            return {"status": "RECOVERY_REQUIRED", "transaction_id": tx_id,
+                     "reason": f"verification failed ({reason}); {msg}"}
+
+        self.store.update_transaction(tx_id, state="ROLLED_BACK", enforcer_state=st)
+        self._event(tx_id, "RESTORE_VALIDATED", result=ok_msg)
+        self._event(tx_id, "ROLLED_BACK", result=ok_msg)
+        enf.record_audit_event(tx_id, "CANONICAL_WRITE_ROLLED_BACK", canonical_path, "restored",
+                                extra={"operation": op, "reason": reason})
         return {"status": "ROLLED_BACK", "transaction_id": tx_id,
                  "reason": f"verification failed ({reason}); rolled back to pre-state, verified"}
 

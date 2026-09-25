@@ -671,6 +671,318 @@ def test_no_direct_filesystem_write_path_exists():
           not any(f in src for f in forbidden))
 
 
+# Phase 8.2-B remediation: rollback lifecycle attestation, independently verified
+# restoration, and transaction-state synchronisation ---------------------------
+# Seam: the existing CorruptingMcp pattern -- a FakeMcpAdapter subclass whose write
+# really lands but corrupted, so the executor's own read-back verification fails
+# and the executor's own _rollback runs. No production fault-injection hook.
+
+class CorruptCreateMcp(FakeMcpAdapter):
+    def __init__(self, *a, delete_result=True, delete_removes=True, unreadable_after_delete=False, **k):
+        super().__init__(*a, **k)
+        self.order = []
+        self.delete_result = delete_result
+        self.delete_removes = delete_removes
+        self.unreadable_after_delete = unreadable_after_delete
+        self.deleted = False
+
+    def read(self, path):
+        self.order.append(("read", path))
+        if self.deleted and self.unreadable_after_delete:
+            raise RuntimeError("mcp read failed after delete")
+        return super().read(path)
+
+    def create(self, path, content):
+        self.order.append(("create", path))
+        self.files[path] = "CORRUPTED WRITE"
+        return True
+
+    def delete(self, path):
+        self.order.append(("delete", path))
+        self.deleted = True
+        if self.delete_removes:
+            self.files.pop(path, None)
+        return self.delete_result
+
+
+def _lock_rows(store):
+    return store._conn.execute("SELECT COUNT(*) FROM path_locks").fetchone()[0]
+
+
+def _in_order(seq, wanted):
+    it = iter(seq)
+    return all(w in it for w in wanted)
+
+
+def _rb_evidence(ex, store, result):
+    tx_id = result["transaction_id"]
+    events = [e["event"] for e in store.get_transaction_events(tx_id)]
+    tx = store.get_transaction(tx_id)
+    manifest = ex.enforcer.read_recovery_point(tx_id)
+    return tx_id, events, tx, manifest, [h["state"] for h in manifest["state_history"]]
+
+
+def _create_proposal():
+    return make_proposal(action="CREATE", section=None, current_content=None,
+                          proposed_content="# _ENFORCER_TEST\n\nDisposable created note.\n")
+
+
+def test_rollback_of_created_file_records_lifecycle_and_verifies_absence():
+    store = make_store()
+    mcp = CorruptCreateMcp()
+    ex = CanonicalExecutor(store, mcp_adapter=mcp)
+    proposal = _create_proposal()
+    persist(store, proposal)
+    check("A: precondition -- target absent before APPLY", mcp.files.get(TEST_PATH) is None)
+    result = ex.execute_proposal(proposal, mode=MODE_APPLY)
+    tx_id, events, tx, manifest, states = _rb_evidence(ex, store, result)
+    check("A: created-file rollback -> ROLLED_BACK", result["status"] == "ROLLED_BACK")
+    check("A: verification failure recorded", "VERIFICATION_FAILED" in events)
+    check("A: FREYA events record restoration lifecycle in order",
+          _in_order(events, ["APPLIED", "VERIFICATION_FAILED", "RESTORING", "RESTORED", "RESTORE_VALIDATED", "ROLLED_BACK"]))
+    check("A: enforcer manifest attests VALIDATION_FAILED -> RESTORING -> RESTORED -> RESTORE_VALIDATED",
+          states[-5:] == ["APPLIED", "VALIDATION_FAILED", "RESTORING", "RESTORED", "RESTORE_VALIDATED"])
+    check("A: enforcer manifest ends RESTORE_VALIDATED, never COMPLETE", manifest["status"] == "RESTORE_VALIDATED")
+    check("A: transaction state ROLLED_BACK, no COMMITTED event", tx["state"] == "ROLLED_BACK" and "COMMITTED" not in events)
+    check("A: transactions.enforcer_state mirrors manifest (not stale APPLIED)",
+          tx["enforcer_state"] == manifest["status"] == "RESTORE_VALIDATED")
+    check("A: created target absent after rollback", mcp.files.get(TEST_PATH) is None)
+    last_delete = max(i for i, e in enumerate(mcp.order) if e[0] == "delete")
+    check("A: absence verified by a fresh MCP read issued AFTER the delete",
+          any(e[0] == "read" for e in mcp.order[last_delete + 1:]))
+    check("A: manifest attests pre_existing=false", manifest["pre_existing"] is False)
+    check("A: recovery artifact remains", (Path(ex.enforcer.RECOVERY_ROOT) / tx_id / "manifest.json").exists())
+    check("A: path lock released", _lock_rows(store) == 0)
+
+
+def test_rollback_of_preexisting_file_records_lifecycle_and_verifies_hash():
+    import hashlib
+
+    class CorruptingMcp(FakeMcpAdapter):
+        def append_to_section(self, path, section, content):
+            self.files[path] = "CORRUPTED, PRE-EXISTING CONTENT LOST"
+            return True
+
+    original = "## Notes\nExisting content.\n"
+    store = make_store()
+    mcp = CorruptingMcp(initial={TEST_PATH: original})
+    ex = CanonicalExecutor(store, mcp_adapter=mcp)
+    proposal = make_proposal()
+    persist(store, proposal)
+    result = ex.execute_proposal(proposal, mode=MODE_APPLY)
+    tx_id, events, tx, manifest, states = _rb_evidence(ex, store, result)
+    check("B: pre-existing rollback -> ROLLED_BACK", result["status"] == "ROLLED_BACK")
+    check("B: original content and hash restored",
+          mcp.files[TEST_PATH] == original and hashlib.sha256(mcp.files[TEST_PATH].encode()).hexdigest() == hashlib.sha256(original.encode()).hexdigest())
+    check("B: FREYA events record restoration lifecycle in order",
+          _in_order(events, ["VERIFICATION_FAILED", "RESTORING", "RESTORED", "RESTORE_VALIDATED", "ROLLED_BACK"]))
+    check("B: enforcer manifest attests the full restoration lifecycle",
+          states[-5:] == ["APPLIED", "VALIDATION_FAILED", "RESTORING", "RESTORED", "RESTORE_VALIDATED"])
+    check("B: manifest attests pre_existing=true and is not COMPLETE", manifest["pre_existing"] is True and manifest["status"] != "COMPLETE")
+    check("B: final transaction state correct, no false COMMITTED",
+          tx["state"] == "ROLLED_BACK" and tx["enforcer_state"] == manifest["status"] and "COMMITTED" not in events)
+    check("B: path lock released", _lock_rows(store) == 0)
+
+
+def _assert_rollback_not_reported_as_success(label, ex, store, result, status, enf_status):
+    tx_id, events, tx, manifest, states = _rb_evidence(ex, store, result)
+    check(f"{label}: result status {status}", result["status"] == status)
+    check(f"{label}: no false-success events", not ({"RESTORE_VALIDATED", "ROLLED_BACK", "COMMITTED"} & set(events)))
+    check(f"{label}: transaction state {status}", tx["state"] == status)
+    check(f"{label}: enforcer never attests RESTORE_VALIDATED / COMPLETE",
+          "RESTORE_VALIDATED" not in states and manifest["status"] == enf_status)
+    check(f"{label}: transactions.enforcer_state mirrors manifest", tx["enforcer_state"] == manifest["status"])
+    check(f"{label}: recovery artifact remains for manual recovery",
+          (Path(ex.enforcer.RECOVERY_ROOT) / tx_id / "manifest.json").exists())
+    check(f"{label}: path lock released", _lock_rows(store) == 0)
+
+
+def test_rollback_delete_failure_is_not_reported_as_restored():
+    store = make_store(); mcp = CorruptCreateMcp(delete_result=False, delete_removes=False)
+    ex = CanonicalExecutor(store, mcp_adapter=mcp)
+    proposal = _create_proposal(); persist(store, proposal)
+    result = ex.execute_proposal(proposal, mode=MODE_APPLY)
+    _assert_rollback_not_reported_as_success("C1 delete returns not-ok", ex, store, result, "ROLLBACK_FAILED", "RESTORE_FAILED")
+
+
+def test_rollback_delete_that_silently_leaves_the_file_is_not_validated():
+    store = make_store(); mcp = CorruptCreateMcp(delete_result=True, delete_removes=False)
+    ex = CanonicalExecutor(store, mcp_adapter=mcp)
+    proposal = _create_proposal(); persist(store, proposal)
+    result = ex.execute_proposal(proposal, mode=MODE_APPLY)
+    _assert_rollback_not_reported_as_success("C2 delete ok=true but target remains", ex, store, result, "ROLLBACK_FAILED", "RESTORE_FAILED")
+    check("C2: failure reason names the surviving target", "still present" in store.get_transaction(result["transaction_id"])["error"])
+
+
+def test_rollback_that_cannot_reread_target_is_not_validated():
+    store = make_store(); mcp = CorruptCreateMcp(unreadable_after_delete=True)
+    ex = CanonicalExecutor(store, mcp_adapter=mcp)
+    proposal = _create_proposal(); persist(store, proposal)
+    result = ex.execute_proposal(proposal, mode=MODE_APPLY)
+    _assert_rollback_not_reported_as_success("C3 absence cannot be re-read", ex, store, result, "ROLLBACK_FAILED", "RESTORE_FAILED")
+    check("C3: an unreadable target is never treated as absent", "could not re-read" in store.get_transaction(result["transaction_id"])["error"])
+
+
+def test_rollback_overwrite_failure_of_preexisting_file_is_not_reported_as_restored():
+    class CorruptNoRestoreMcp(FakeMcpAdapter):
+        def append_to_section(self, path, section, content):
+            self.files[path] = "CORRUPTED, PRE-EXISTING CONTENT LOST"
+            return True
+
+        def overwrite(self, path, content):
+            return False
+
+    store = make_store(); mcp = CorruptNoRestoreMcp(initial={TEST_PATH: "## Notes\nExisting content.\n"})
+    ex = CanonicalExecutor(store, mcp_adapter=mcp)
+    proposal = make_proposal(); persist(store, proposal)
+    result = ex.execute_proposal(proposal, mode=MODE_APPLY)
+    _assert_rollback_not_reported_as_success("C4 pre-existing restore fails", ex, store, result, "ROLLBACK_FAILED", "RESTORE_FAILED")
+
+
+def test_rollback_not_claimed_when_enforcer_cannot_attest_restoration():
+    real = load_real_enforcer()
+
+    class NoRestoreLifecycleEnforcer:
+        """Stands in for an enforcer whose state machine has no rollback lifecycle."""
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def update_transaction_state(self, tx_id, new_state, note=""):
+            if new_state in ("RESTORING", "RESTORED", "RESTORE_VALIDATED"):
+                raise self._inner.EnforcerError("no rollback lifecycle in this enforcer")
+            return self._inner.update_transaction_state(tx_id, new_state, note=note)
+
+    store = make_store(); mcp = CorruptCreateMcp()
+    ex = CanonicalExecutor(store, enforcer=NoRestoreLifecycleEnforcer(real), mcp_adapter=mcp)
+    proposal = _create_proposal(); persist(store, proposal)
+    result = ex.execute_proposal(proposal, mode=MODE_APPLY)
+    _assert_rollback_not_reported_as_success("D enforcer cannot attest", ex, store, result, "RECOVERY_REQUIRED", "VALIDATION_FAILED")
+    check("D: physical restoration still happened (target absent)", mcp.files.get(TEST_PATH) is None)
+
+
+# Phase 8.3: idempotency and stale-plan protection -----------------------------
+
+def test_create_stale_when_target_now_exists():
+    """A CREATE proposal is always planned against an absent target
+    (current_content=None). If the target now exists -- created through
+    any legitimate means since planning -- APPLY must refuse to overwrite
+    it, not silently clobber it via the real create_vault_file call
+    (which overwrites unconditionally)."""
+    store = make_store()
+    mcp = FakeMcpAdapter(initial={TEST_PATH: "# SOMEONE ELSE CREATED THIS SINCE PLANNING\n"})
+    ex = CanonicalExecutor(store, mcp_adapter=mcp)
+    proposal = _create_proposal()
+    persist(store, proposal)
+    result = ex.execute_proposal(proposal, mode=MODE_APPLY)
+    check("stale CREATE (target now exists) -> STALE", result["status"] == "STALE")
+    check("stale CREATE performs no write", mcp.calls == [])
+    check("pre-existing content at CREATE target left untouched",
+          mcp.files[TEST_PATH] == "# SOMEONE ELSE CREATED THIS SINCE PLANNING\n")
+
+
+def test_create_still_succeeds_when_target_genuinely_absent():
+    """Companion to the stale-CREATE test: confirms the new CREATE-specific
+    staleness branch doesn't regress the ordinary case of a CREATE against
+    a target that is still genuinely absent at APPLY time."""
+    ex, store, mcp = new_executor()
+    proposal = _create_proposal()
+    persist(store, proposal)
+    check("precondition: target absent", mcp.files.get(TEST_PATH) is None)
+    result = ex.execute_proposal(proposal, mode=MODE_APPLY)
+    check("CREATE against genuinely absent target -> COMMITTED", result["status"] == "COMMITTED")
+    check("CREATE writes proposed content", mcp.files.get(TEST_PATH) == proposal["proposed_content"])
+
+
+def test_create_duplicate_execution_idempotent():
+    """Idempotency (TEST 1 / TEST 7) specifically for CREATE, not just
+    APPEND -- same proposal executed twice must not produce a second
+    canonical write."""
+    ex, store, mcp = new_executor()
+    proposal = _create_proposal()
+    persist(store, proposal)
+    first = ex.execute_proposal(proposal, mode=MODE_APPLY)
+    content_after_first = mcp.files[TEST_PATH]
+    calls_after_first = list(mcp.calls)
+    second = ex.execute_proposal(proposal, mode=MODE_APPLY)
+    check("first CREATE execution commits", first["status"] == "COMMITTED")
+    check("second identical CREATE execution is ALREADY_APPLIED", second["status"] == "ALREADY_APPLIED")
+    check("no duplicate CREATE write on the adapter", mcp.calls == calls_after_first)
+    check("canonical content unchanged by the second execution", mcp.files[TEST_PATH] == content_after_first)
+
+
+def test_dry_run_does_not_poison_idempotency():
+    """TEST 2: a DRY_RUN must never make a proposal appear committed --
+    a subsequent real APPLY of the same fingerprint must still execute
+    and commit, not be short-circuited as ALREADY_APPLIED."""
+    ex, store, mcp = new_executor(initial_files={TEST_PATH: "## Notes\nExisting content.\n"})
+    proposal = make_proposal()
+    persist(store, proposal)
+    dry = ex.execute_proposal(proposal, mode=MODE_DRY_RUN)
+    check("DRY_RUN reaches DRY_RUN_VALIDATED", dry["status"] == "DRY_RUN_VALIDATED")
+    check("DRY_RUN performs no write", mcp.calls == [])
+    apply_result = ex.execute_proposal(proposal, mode=MODE_APPLY)
+    check("APPLY after DRY_RUN of same fingerprint still commits (not ALREADY_APPLIED)",
+          apply_result["status"] == "COMMITTED")
+    check("DRY_RUN-then-APPLY: fingerprint has no committed tx before the real APPLY runs",
+          store.get_committed_transaction_for_fingerprint(proposal["fingerprint"]) is None or
+          store.get_committed_transaction_for_fingerprint(proposal["fingerprint"])["transaction_id"] == apply_result["transaction_id"])
+
+
+def test_rolled_back_proposal_can_be_retried_after_underlying_fault_clears():
+    """TEST 4: a proposal that genuinely failed (write corrupted -> verification
+    failed -> rolled back) must not be permanently poisoned. Once the
+    underlying fault clears, the identical fingerprint must be retryable
+    and reach COMMITTED -- rollback is not an idempotency-cache entry."""
+    store = make_store()
+    broken_mcp = CorruptCreateMcp()
+    ex = CanonicalExecutor(store, mcp_adapter=broken_mcp)
+    proposal = _create_proposal()
+    persist(store, proposal)
+
+    first = ex.execute_proposal(proposal, mode=MODE_APPLY)
+    check("first attempt (corrupted write) rolls back", first["status"] == "ROLLED_BACK")
+    check("rollback restores absence", broken_mcp.files.get(TEST_PATH) is None)
+    check("rolled-back fingerprint is NOT recorded as committed",
+          store.get_committed_transaction_for_fingerprint(proposal["fingerprint"]) is None)
+
+    # Underlying fault clears: retry against a working adapter, same store/fingerprint.
+    working_mcp = FakeMcpAdapter()
+    ex2 = CanonicalExecutor(store, mcp_adapter=working_mcp)
+    retry = ex2.execute_proposal(proposal, mode=MODE_APPLY)
+    check("retry of the same fingerprint after rollback is NOT permanently poisoned",
+          retry["status"] != "ALREADY_APPLIED")
+    check("retry after rollback reaches COMMITTED once the fault clears", retry["status"] == "COMMITTED")
+    check("retry writes the proposed content", working_mcp.files.get(TEST_PATH) == proposal["proposed_content"])
+
+
+def test_path_lock_prevents_duplicate_write_under_concurrent_attempt():
+    """TEST 6: document the actual concurrency guarantee. The idempotency
+    check (get_committed_transaction_for_fingerprint) runs BEFORE the path
+    lock is acquired, so two callers racing on the same fingerprint before
+    either has committed will not both see ALREADY_APPLIED -- the guarantee
+    against a duplicate WRITE comes from the path lock, not the fingerprint
+    check: the loser is BLOCKED by the lock, never proceeds to _dispatch_write."""
+    store = make_store()
+    mcp = FakeMcpAdapter()
+    ex = CanonicalExecutor(store, mcp_adapter=mcp)
+    proposal = _create_proposal()
+    persist(store, proposal)
+    # Simulate a second in-flight transaction already holding the lock for
+    # this exact path, as if two executors raced to be first.
+    assert store.acquire_path_lock(TEST_PATH, "tx-racer-inflight")
+    result = ex.execute_proposal(proposal, mode=MODE_APPLY)
+    check("racing attempt on a locked path -> BLOCKED, not a second write", result["status"] == "BLOCKED")
+    check("no write reached the adapter while the path was locked", mcp.calls == [])
+    store.release_path_lock(TEST_PATH, "tx-racer-inflight")
+    # Lock now free: the same fingerprint can proceed normally.
+    result2 = ex.execute_proposal(proposal, mode=MODE_APPLY)
+    check("after the lock is released, the same fingerprint proceeds and commits",
+          result2["status"] == "COMMITTED")
+
+
 if __name__ == "__main__":
     test_real_enforcer_loads()
     test_valid_append_dry_run_then_apply()
@@ -715,6 +1027,19 @@ if __name__ == "__main__":
     test_origin_dry_run_still_zero_writes_for_production()
     test_origin_not_mutated_by_executor()
     test_origin_caller_cannot_override_validation_with_apply_arg()
+    test_rollback_of_created_file_records_lifecycle_and_verifies_absence()
+    test_rollback_of_preexisting_file_records_lifecycle_and_verifies_hash()
+    test_rollback_delete_failure_is_not_reported_as_restored()
+    test_rollback_delete_that_silently_leaves_the_file_is_not_validated()
+    test_rollback_that_cannot_reread_target_is_not_validated()
+    test_rollback_overwrite_failure_of_preexisting_file_is_not_reported_as_restored()
+    test_rollback_not_claimed_when_enforcer_cannot_attest_restoration()
+    test_create_stale_when_target_now_exists()
+    test_create_still_succeeds_when_target_genuinely_absent()
+    test_create_duplicate_execution_idempotent()
+    test_dry_run_does_not_poison_idempotency()
+    test_rolled_back_proposal_can_be_retried_after_underlying_fault_clears()
+    test_path_lock_prevents_duplicate_write_under_concurrent_attempt()
 
     print(f"\n{PASS} passed, {FAIL} failed")
     if FAIL:
